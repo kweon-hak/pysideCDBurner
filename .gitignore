@@ -1,0 +1,22 @@
+# Virtual environments
+venv/
+.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Environment variables
+.env
+
+# VS Code
+.vscode/
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+
+# 프로젝트 루트에 있는 특정 파일
+Mahm0udwally-All-Flat-DVD-CD.256.png
