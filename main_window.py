@@ -13,8 +13,13 @@ from PySide6.QtWidgets import (
     QSizePolicy, QRadioButton, QCheckBox, QSplitter, QStyle, QProxyStyle,
     QSpacerItem
 )
+try:
+    from shiboken6 import shiboken6
+except Exception:
+    shiboken6 = None
 
 from constants import APP_ICON_PATH, APP_TITLE, FS_ISO9660, FS_JOLIET, FS_UDF
+from translations import LANGUAGE_NAMES, TRANSLATIONS
 from utils import sanitize_volume_label, force_dialog_accept_label
 from widgets import FileFolderDialog, CustomIconProvider
 from imapi import list_imapi_writers
@@ -24,12 +29,16 @@ from workers import BurnWorker, SizeWorker, IsoCreateWorker
 class DropListWidget(QListWidget):
     """QListWidget with simple file/folder drag-and-drop support."""
 
-    def __init__(self, add_callback, parent=None):
+    def __init__(self, add_callback, hint_text: str = "", parent=None):
         super().__init__(parent)
         self._add_callback = add_callback
-        self._hint_text = "Drag and drop files or folders here, or use Add files/folders."
+        self._hint_text = hint_text
         self.setAcceptDrops(True)
         self.setSelectionMode(QListWidget.ExtendedSelection)
+
+    def set_hint_text(self, text: str):
+        self._hint_text = text
+        self.viewport().update()
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
@@ -183,13 +192,17 @@ class MediaStatusWorker(QThread):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(APP_TITLE)
         self._app_icon = QIcon(str(APP_ICON_PATH)) if APP_ICON_PATH.exists() else QIcon()
         self.setWindowIcon(self._app_icon)
-
+        self.settings = QSettings("PySideCDBurner", "PySideCDBurner")
+        lang_val = str(self.settings.value("language", "en")).lower()
+        self._language = lang_val if lang_val in LANGUAGE_NAMES else "en"
+        self._text_bindings: list[tuple[object, str, str, object | None]] = []
+        self._status_text_key: str = "Idle"
+        self._last_media_key: str | None = "Media status: unknown"
+        self._last_media_kwargs: dict | None = {}
         self.worker: BurnWorker | None = None
         self._writer_worker: QThread | None = None
-        self.settings = QSettings("PySideCDBurner", "PySideCDBurner")
         self._fs_options = [
             ("ISO9660 + Joliet (default)", FS_ISO9660 | FS_JOLIET),
             ("ISO9660 only", FS_ISO9660),
@@ -238,6 +251,9 @@ class MainWindow(QMainWindow):
         self._media_usage_dirty: bool = False
         self._theme = str(self.settings.value("theme", "light")).lower()
         self._default_palette = QApplication.instance().palette() if QApplication.instance() else None
+        self._language_actions: list[QAction] = []
+
+        self._bind_text(self, "setWindowTitle", APP_TITLE)
 
         self._init_ui()
         self._init_actions()
@@ -265,6 +281,97 @@ class MainWindow(QMainWindow):
         self.elapsed_timer.timeout.connect(self._update_elapsed_label)
         self._update_list_buttons_and_burn_state()
 
+    def _t(self, key: str, **params) -> str:
+        table = TRANSLATIONS.get(self._language, {})
+        result = table.get(key, key)
+        if params:
+            try:
+                result = result.format(**params)
+            except Exception:
+                pass
+        return result
+
+    def _is_alive(self, obj) -> bool:
+        if obj is None:
+            return False
+        if shiboken6 is not None:
+            try:
+                return shiboken6.isValid(obj)
+            except Exception:
+                pass
+        try:
+            return bool(obj)
+        except Exception:
+            return False
+
+    def _apply_binding(self, obj, attr: str, text: str, fmt):
+        if not self._is_alive(obj):
+            return False
+        args = fmt() if callable(fmt) else (fmt or {})
+        try:
+            value = self._t(text, **args)
+        except Exception:
+            value = text
+        setter = getattr(obj, attr, None)
+        if callable(setter):
+            try:
+                setter(value)
+            except RuntimeError as e:
+                # 객체가 이미 파괴된 경우 무시하고 호출자에게 실패 알림
+                if "Internal C++ object" in str(e):
+                    return False
+                raise
+        return True
+
+    def _bind_text(self, obj, attr: str, text: str, fmt=None):
+        if not self._is_alive(obj):
+            return
+        self._text_bindings.append((obj, attr, text, fmt))
+        self._apply_binding(obj, attr, text, fmt)
+
+    def _set_language(self, lang: str):
+        if lang not in LANGUAGE_NAMES:
+            return
+        if lang == self._language:
+            return
+        self._language = lang
+        self.settings.setValue("language", lang)
+        self.settings.sync()
+        self._apply_language()
+
+    def _apply_language(self):
+        alive_bindings = []
+        for obj, attr, text, fmt in list(self._text_bindings):
+            if not self._is_alive(obj):
+                continue
+            if self._apply_binding(obj, attr, text, fmt):
+                alive_bindings.append((obj, attr, text, fmt))
+        self._text_bindings = alive_bindings
+        self._last_status_text = None
+        self._last_media_text = None
+        if getattr(self, "_status_text_key", None):
+            self._apply_binding(self.status, "setText", self._status_text_key, None)
+        if hasattr(self, "list"):
+            self.list.set_hint_text(self._t("Drag and drop files or folders here, or use Add files/folders."))
+        self._update_mode_hint()
+        self._update_fs_display()
+        self._update_total_size_label()
+        self._update_burn_enabled()
+        self._update_media_usage_label()
+        if hasattr(self, "write_speed"):
+            self._populate_write_speeds()
+        if getattr(self, "_last_media_key", None):
+            self._set_media_status(self._last_media_key, **(self._last_media_kwargs or {}))
+        self._update_language_menu_checks()
+
+    def _update_language_menu_checks(self):
+        if not getattr(self, "_language_actions", None):
+            return
+        for act in self._language_actions:
+            act.blockSignals(True)
+            act.setChecked(act.data() == self._language)
+            act.blockSignals(False)
+
     def _init_ui(self):
         root = QWidget()
         self.setCentralWidget(root)
@@ -291,20 +398,24 @@ class MainWindow(QMainWindow):
         right_layout.setSpacing(8)
 
         # Files
-        g = QGroupBox("Files / Folders to burn")
+        g = QGroupBox()
+        self._bind_text(g, "setTitle", "Files / Folders to burn")
         gl = QVBoxLayout(g)
-        self.list = DropListWidget(self._on_drop_add, self)
+        self.list = DropListWidget(self._on_drop_add, self._t("Drag and drop files or folders here, or use Add files/folders."), self)
         gl.addWidget(self.list, 1)
-        self.total_size_label = QLabel("Total size: 0 B")
+        self.total_size_label = QLabel()
         self.total_size_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         gl.addWidget(self.total_size_label)
-        self.media_usage_label = QLabel("Media usage: --")
+        self.media_usage_label = QLabel()
         self.media_usage_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         gl.addWidget(self.media_usage_label)
         btn_row = QHBoxLayout()
-        self.btn_add_files = QPushButton("Add files/folders")
-        self.btn_remove = QPushButton("Remove selected")
-        self.btn_clear = QPushButton("Clear")
+        self.btn_add_files = QPushButton()
+        self._bind_text(self.btn_add_files, "setText", "Add files/folders")
+        self.btn_remove = QPushButton()
+        self._bind_text(self.btn_remove, "setText", "Remove selected")
+        self.btn_clear = QPushButton()
+        self._bind_text(self.btn_clear, "setText", "Clear")
         btn_row.addWidget(self.btn_add_files)
         btn_row.addStretch(1)
         btn_row.addWidget(self.btn_remove)
@@ -313,16 +424,19 @@ class MainWindow(QMainWindow):
         left_splitter.addWidget(g)
 
         # Log panel under files
-        log_box = QGroupBox("Log")
+        log_box = QGroupBox()
+        self._bind_text(log_box, "setTitle", "Log")
         log_layout = QVBoxLayout(log_box)
         log_layout.setContentsMargins(8, 8, 8, 8)
         toggle_row = QHBoxLayout()
-        self.btn_hide_log = QPushButton("Hide log")
+        self.btn_hide_log = QPushButton()
+        self._bind_text(self.btn_hide_log, "setText", "Hide log")
         self.btn_hide_log.setFlat(True)
         self.btn_hide_log.setCursor(Qt.PointingHandCursor)
         self.btn_hide_log.clicked.connect(lambda: self._toggle_log_visibility(False))
         self.btn_hide_log.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
-        self.btn_clear_log = QPushButton("Clear log")
+        self.btn_clear_log = QPushButton()
+        self._bind_text(self.btn_clear_log, "setText", "Clear log")
         self.btn_clear_log.setFlat(True)
         self.btn_clear_log.setCursor(Qt.PointingHandCursor)
         self.btn_clear_log.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
@@ -342,33 +456,47 @@ class MainWindow(QMainWindow):
         left_splitter.setStretchFactor(1, 2)
 
         # Settings
-        g = QGroupBox("Settings")
+        g = QGroupBox()
+        self._bind_text(g, "setTitle", "Settings")
         f = QFormLayout(g)
         self.volume = QLineEdit("DATA")
-        f.addRow("Volume label:", self.volume)
+        volume_label = QLabel()
+        self._bind_text(volume_label, "setText", "Volume label:")
+        f.addRow(volume_label, self.volume)
         self.drive = QComboBox()
         self.btn_refresh = QPushButton()
-        self.btn_refresh.setToolTip("Refresh drives")
+        self._bind_text(self.btn_refresh, "setToolTip", "Refresh drives")
         drow = QHBoxLayout()
         drow.addWidget(self.drive, 1)
         drow.addWidget(self.btn_refresh)
-        f.addRow("CD/DVD Writer:", drow)
+        writer_label = QLabel()
+        self._bind_text(writer_label, "setText", "CD/DVD Writer:")
+        f.addRow(writer_label, drow)
         self.write_speed = QComboBox()
-        self.write_speed.addItem("Max (auto)", None)
-        f.addRow("Write speed:", self.write_speed)
+        self.write_speed.addItem(self._t("Max (auto)"), None)
+        write_speed_label = QLabel()
+        self._bind_text(write_speed_label, "setText", "Write speed:")
+        f.addRow(write_speed_label, self.write_speed)
         self.fs_display = QLabel(self._fs_label(self._fs_mask))
-        f.addRow("Filesystem:", self.fs_display)
+        fs_label = QLabel()
+        self._bind_text(fs_label, "setText", "Filesystem:")
+        f.addRow(fs_label, self.fs_display)
         right_layout.addWidget(g)
 
         # Burn / status
-        g = QGroupBox("Burn")
+        g = QGroupBox()
+        self._bind_text(g, "setTitle", "Burn")
         gl = QVBoxLayout(g)
         gl.setContentsMargins(8, 8, 8, 8)
 
         action_row = QHBoxLayout()
-        action_row.addWidget(QLabel("Action:"))
-        self.action_burn_disc = QRadioButton("Burn to disc")
-        self.action_create_iso = QRadioButton("Create ISO file")
+        action_label = QLabel()
+        self._bind_text(action_label, "setText", "Action:")
+        action_row.addWidget(action_label)
+        self.action_burn_disc = QRadioButton()
+        self._bind_text(self.action_burn_disc, "setText", "Burn to disc")
+        self.action_create_iso = QRadioButton()
+        self._bind_text(self.action_create_iso, "setText", "Create ISO file")
         self.action_burn_disc.setChecked(True)
         action_row.addWidget(self.action_burn_disc)
         action_row.addWidget(self.action_create_iso)
@@ -376,30 +504,35 @@ class MainWindow(QMainWindow):
         gl.addLayout(action_row)
 
         iso_input_row = QHBoxLayout()
-        self.chk_use_iso_input = QCheckBox("Use existing ISO to burn")
+        self.chk_use_iso_input = QCheckBox()
+        self._bind_text(self.chk_use_iso_input, "setText", "Use existing ISO to burn")
         iso_input_row.addWidget(self.chk_use_iso_input)
         iso_input_row.addStretch(1)
         gl.addLayout(iso_input_row)
 
         burn_iso_row = QHBoxLayout()
         self.iso_path_edit = QLineEdit()
-        self.iso_path_edit.setPlaceholderText("Select ISO to burn")
+        self._bind_text(self.iso_path_edit, "setPlaceholderText", "Select ISO to burn")
         self.iso_path_edit.setReadOnly(True)
-        self.btn_browse_iso = QPushButton("Browse ISO")
-        self.btn_clear_iso = QPushButton("Clear")
+        self.btn_browse_iso = QPushButton()
+        self._bind_text(self.btn_browse_iso, "setText", "Browse ISO")
+        self.btn_clear_iso = QPushButton()
+        self._bind_text(self.btn_clear_iso, "setText", "Clear")
         burn_iso_row.addWidget(self.iso_path_edit, 1)
         burn_iso_row.addWidget(self.btn_browse_iso)
         burn_iso_row.addWidget(self.btn_clear_iso)
         gl.addLayout(burn_iso_row)
 
-        self.chk_verify = QCheckBox("Verify after operation")
+        self.chk_verify = QCheckBox()
+        self._bind_text(self.chk_verify, "setText", "Verify after operation")
         gl.addWidget(self.chk_verify)
 
         iso_out_row = QHBoxLayout()
         self.iso_out_path_edit = QLineEdit()
-        self.iso_out_path_edit.setPlaceholderText("Select destination ISO file")
+        self._bind_text(self.iso_out_path_edit, "setPlaceholderText", "Select destination ISO file")
         iso_out_row.addWidget(self.iso_out_path_edit, 1)
-        self.btn_browse_iso_out = QPushButton("ISO Output")
+        self.btn_browse_iso_out = QPushButton()
+        self._bind_text(self.btn_browse_iso_out, "setText", "ISO Output")
         iso_out_row.addWidget(self.btn_browse_iso_out)
         gl.addLayout(iso_out_row)
 
@@ -408,8 +541,10 @@ class MainWindow(QMainWindow):
 
         act_row = QHBoxLayout()
         # Add a leading space so icon and text have visible separation.
-        self.btn_burn = QPushButton(" Burn")
-        self.btn_stop = QPushButton(" Stop")
+        self.btn_burn = QPushButton()
+        self._bind_text(self.btn_burn, "setText", " Burn")
+        self.btn_stop = QPushButton()
+        self._bind_text(self.btn_stop, "setText", " Stop")
         for btn in (self.btn_burn, self.btn_stop):
             btn.setMinimumHeight(36)
             # Extra padding further separates icon and label.
@@ -421,7 +556,8 @@ class MainWindow(QMainWindow):
 
         gl.addStretch(1)
 
-        self.status = QLabel("Idle")
+        self.status = QLabel()
+        self._bind_text(self.status, "setText", "Idle")
         self.status.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
@@ -439,7 +575,8 @@ class MainWindow(QMainWindow):
         self._reset_progress_info_label()
         self._ensure_elapsed_timer_running()
 
-        self.mode_hint = QLabel("Tip: choose your burn mode first, then add files or select an ISO.")
+        self.mode_hint = QLabel()
+        self._bind_text(self.mode_hint, "setText", "Tip: choose your burn mode first, then add files or select an ISO.")
         self.mode_hint.setWordWrap(True)
         self.mode_hint.setStyleSheet("color: #6b6b6b; font-size: 12px;")
         gl.addWidget(self.mode_hint)
@@ -453,10 +590,12 @@ class MainWindow(QMainWindow):
 
         root_layout.addWidget(splitter)
 
-        self.status_label = QLabel("Idle")
+        self.status_label = QLabel()
+        self._bind_text(self.status_label, "setText", "Idle")
         # 약간의 하단 여백을 주고 왼쪽에 배치한다.
         self.status_label.setContentsMargins(4, 0, 4, 2)
-        self.media_status = QLabel("Media status: unknown")
+        self.media_status = QLabel()
+        self._bind_text(self.media_status, "setText", "Media status: unknown")
         self.media_status.setContentsMargins(4, 0, 4, 0)
         self.media_status.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.media_status.setVisible(False)  # 상태바에서 미디어 상태는 숨긴다(중복 표시 제거)
@@ -464,27 +603,37 @@ class MainWindow(QMainWindow):
         # 상태바에는 미디어 상태를 추가하지 않는다
 
     def _init_actions(self):
-        menu = self.menuBar().addMenu("File")
-        fs_menu = menu.addMenu("Filesystem")
+        menu_bar = self.menuBar()
+        file_menu = menu_bar.addMenu("")
+        self._bind_text(file_menu, "setTitle", "File")
+        fs_menu = file_menu.addMenu("")
+        self._bind_text(fs_menu, "setTitle", "Filesystem")
         self._setup_filesystem_actions(fs_menu)
-        act_eject = QAction("Eject disc", self)
+        act_eject = QAction(self)
+        self._bind_text(act_eject, "setText", "Eject disc")
         act_eject.triggered.connect(self.eject_disc)
-        menu.addAction(act_eject)
+        file_menu.addAction(act_eject)
         self.act_eject = act_eject
-        menu.addSeparator()
-        act_exit = QAction("Exit", self)
+        file_menu.addSeparator()
+        act_exit = QAction(self)
+        self._bind_text(act_exit, "setText", "Exit")
         act_exit.triggered.connect(self.close)
-        menu.addAction(act_exit)
-        view_menu = self.menuBar().addMenu("View")
-        self.act_log = QAction("Show Log Panel", self, checkable=True)
+        file_menu.addAction(act_exit)
+
+        view_menu = menu_bar.addMenu("")
+        self._bind_text(view_menu, "setTitle", "View")
+        self.act_log = QAction(self, checkable=True)
+        self._bind_text(self.act_log, "setText", "Show Log Panel")
         self.act_log.setChecked(True)
         self.act_log.toggled.connect(lambda checked: self._toggle_log_visibility(checked))
         view_menu.addAction(self.act_log)
         self._toggle_log_visibility(self.act_log.isChecked())
         view_menu.addSeparator()
         theme_group = QActionGroup(self)
-        self.act_theme_light = QAction("Light Theme", self, checkable=True)
-        self.act_theme_dark = QAction("Dark Theme", self, checkable=True)
+        self.act_theme_light = QAction(self, checkable=True)
+        self._bind_text(self.act_theme_light, "setText", "Light Theme")
+        self.act_theme_dark = QAction(self, checkable=True)
+        self._bind_text(self.act_theme_dark, "setText", "Dark Theme")
         theme_group.addAction(self.act_theme_light)
         theme_group.addAction(self.act_theme_dark)
         self.act_theme_light.setChecked(self._theme != "dark")
@@ -493,10 +642,30 @@ class MainWindow(QMainWindow):
         self.act_theme_dark.triggered.connect(lambda: self._set_theme("dark"))
         view_menu.addAction(self.act_theme_light)
         view_menu.addAction(self.act_theme_dark)
-        help_menu = self.menuBar().addMenu("Help")
-        act_about = QAction("About", self)
+
+        lang_menu = menu_bar.addMenu("")
+        self._bind_text(lang_menu, "setTitle", "Language")
+        lang_group = QActionGroup(self)
+        lang_group.setExclusive(True)
+        self._language_actions = []
+        for code in ("en", "ko"):
+            label = LANGUAGE_NAMES.get(code, code)
+            act_lang = QAction(self._t(label), self, checkable=True)
+            act_lang.setData(code)
+            act_lang.setChecked(code == self._language)
+            act_lang.triggered.connect(lambda checked, c=code: self._set_language(c) if checked else None)
+            lang_group.addAction(act_lang)
+            lang_menu.addAction(act_lang)
+            self._bind_text(act_lang, "setText", label)
+            self._language_actions.append(act_lang)
+
+        help_menu = menu_bar.addMenu("")
+        self._bind_text(help_menu, "setTitle", "Help")
+        act_about = QAction(self)
+        self._bind_text(act_about, "setText", "About")
         act_about.triggered.connect(self.show_about)
         help_menu.addAction(act_about)
+        self._update_language_menu_checks()
 
         self.btn_add_files.clicked.connect(self.add_files)
         self.btn_remove.clicked.connect(self.remove_selected)
@@ -518,7 +687,8 @@ class MainWindow(QMainWindow):
     def _setup_filesystem_actions(self, menu):
         self.fs_group = QActionGroup(self)
         for text, mask in self._fs_options:
-            act = QAction(text, self, checkable=True)
+            act = QAction(self, checkable=True)
+            self._bind_text(act, "setText", text)
             act.setData(mask)
             self.fs_group.addAction(act)
             menu.addAction(act)
@@ -542,11 +712,11 @@ class MainWindow(QMainWindow):
         create_iso = self._is_create_iso_mode()
         use_iso = self._use_iso_input() and not create_iso
         if create_iso:
-            text = "Create ISO: selected files/folders will be saved into an ISO."
+            text = self._t("Create ISO: selected files/folders will be saved into an ISO.")
         elif use_iso:
-            text = "Burn existing ISO: files list is ignored; the chosen ISO will be burned."
+            text = self._t("Burn existing ISO: files list is ignored; the chosen ISO will be burned.")
         else:
-            text = "Burn files/folders directly to disc. Add files and insert blank media."
+            text = self._t("Burn files/folders directly to disc. Add files and insert blank media.")
         self.mode_hint.setText(text)
 
     def _on_fs_selected(self, action: QAction):
@@ -556,7 +726,7 @@ class MainWindow(QMainWindow):
             mask = FS_ISO9660 | FS_JOLIET
         self._fs_mask = mask
         self.settings.setValue("fs_mask", mask)
-        self._append_log(f"Filesystem -> {action.text()}")
+        self._append_log("Filesystem -> {text}", text=action.text())
         self._apply_label_rules()
         self._normalize_volume_text()
         self._update_fs_display()
@@ -643,9 +813,9 @@ class MainWindow(QMainWindow):
                 self.progress_info.setStyleSheet("color: #4a4a4a; font-size: 12px;")
 
     def _fs_label(self, mask: int) -> str:
-        mapping = [(FS_ISO9660, "ISO9660"), (FS_JOLIET, "Joliet"), (FS_UDF, "UDF")]
+        mapping = [(FS_ISO9660, self._t("ISO9660")), (FS_JOLIET, self._t("Joliet")), (FS_UDF, self._t("UDF"))]
         parts = [name for bit, name in mapping if mask & bit]
-        return " + ".join(parts) if parts else "ISO9660 + Joliet"
+        return " + ".join(parts) if parts else self._t("ISO9660 + Joliet")
 
     def _label_rules_for_mask(self, mask: int) -> dict:
         has_iso = bool(mask & FS_ISO9660)
@@ -674,12 +844,12 @@ class MainWindow(QMainWindow):
 
     def _on_speed_changed(self, _index: int):
         text = self.write_speed.currentText()
-        self._append_log(f"Write speed -> {text}")
+        self._append_log("Write speed -> {text}", text=text)
 
     def _populate_write_speeds(self):
         self.write_speed.blockSignals(True)
         self.write_speed.clear()
-        self.write_speed.addItem("Max (auto)", None)
+        self.write_speed.addItem(self._t("Max (auto)"), None)
         uid = self.drive.currentData()
         if uid:
             cached = self._speed_cache.get(uid)
@@ -706,7 +876,7 @@ class MainWindow(QMainWindow):
         self._speed_cache[uid] = entries
         self.write_speed.blockSignals(True)
         self.write_speed.clear()
-        self.write_speed.addItem("Max (auto)", None)
+        self.write_speed.addItem(self._t("Max (auto)"), None)
         for label, val in entries:
             self.write_speed.addItem(label, val)
         self.write_speed.blockSignals(False)
@@ -717,8 +887,14 @@ class MainWindow(QMainWindow):
         # 실패하면 캐시 없이 기본 상태 유지
         self._speed_cache.pop(uid, None)
 
-    def _append_log(self, msg: str):
-        self.log.append(msg)
+    def _append_log(self, key: str, translate: bool = True, **params):
+        if not hasattr(self, "log") or not self._is_alive(getattr(self, "log", None)):
+            return
+        try:
+            text = self._t(key, **params) if translate else str(key)
+        except Exception:
+            text = str(key)
+        self.log.append(text)
         cursor = self.log.textCursor()
         cursor.movePosition(QTextCursor.End)
         self.log.setTextCursor(cursor)
@@ -762,7 +938,12 @@ class MainWindow(QMainWindow):
         self._on_action_mode_changed(True)
 
     def _select_iso_file(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Select ISO file", str(self.last_dir_iso_in), "ISO files (*.iso);;All files (*)")
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            self._t("Select ISO file"),
+            str(self.last_dir_iso_in),
+            self._t("ISO files (*.iso);;All files (*)"),
+        )
         if path:
             self._iso_path = path
             self.iso_path_edit.setText(path)
@@ -783,9 +964,9 @@ class MainWindow(QMainWindow):
         self._update_burn_enabled()
 
     def _select_iso_output(self):
-        dlg = QFileDialog(self, "Save ISO file", str(self.last_dir_iso_out))
+        dlg = QFileDialog(self, self._t("Save ISO file"), str(self.last_dir_iso_out))
         dlg.setAcceptMode(QFileDialog.AcceptSave)
-        dlg.setNameFilter("ISO files (*.iso)")
+        dlg.setNameFilter(self._t("ISO files (*.iso)"))
         dlg.setDefaultSuffix("iso")
         dlg.setOption(QFileDialog.DontUseNativeDialog, True)
         dlg.selectFile("output.iso")
@@ -806,8 +987,8 @@ class MainWindow(QMainWindow):
     def _confirm_overwrite(self, path: str) -> bool:
         ret = QMessageBox.question(
             self,
-            "Overwrite",
-            f"File already exists:\n{path}\nOverwrite it?",
+            self._t("Overwrite"),
+            self._t("File already exists:\\n{path}\\nOverwrite it?", path=path),
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
@@ -815,7 +996,7 @@ class MainWindow(QMainWindow):
 
     def show_about(self):
         dialog = QDialog(self)
-        dialog.setWindowTitle("About")
+        dialog.setWindowTitle(self._t("About"))
         dialog.setWindowIcon(self._app_icon)
         dialog.resize(250, 150)
         layout = QVBoxLayout(dialog)
@@ -831,10 +1012,10 @@ class MainWindow(QMainWindow):
         text_col = QVBoxLayout()
         text_col.setContentsMargins(12, 0, 0, 0)
         label = QLabel(
-            "<p align='left'>PySide CD Burner</p>"
-            "<p align='left'>Updated: 2025.12</p>"
-            "<p align='left'>Author: KHLEE</p>"
-            "<p align='left'>Simple, fast ISO creation and disc burning tool.</p>"
+            f"<p align='left'>{self._t(APP_TITLE)}</p>"
+            f"<p align='left'>{self._t('Updated: 2025.12')}</p>"
+            f"<p align='left'>{self._t('Author: KHLEE')}</p>"
+            f"<p align='left'>{self._t('Simple, fast ISO creation and disc burning tool.')}</p>"
         )
         text_col.addWidget(label)
         text_col.addStretch(1)
@@ -842,7 +1023,8 @@ class MainWindow(QMainWindow):
         layout.addLayout(header_row)
         layout.addStretch(1)
 
-        btn = QPushButton("OK")
+        btn = QPushButton()
+        self._bind_text(btn, "setText", "OK")
         btn.clicked.connect(dialog.accept)
         btn_row = QHBoxLayout()
         btn_row.addStretch(1)
@@ -877,7 +1059,7 @@ class MainWindow(QMainWindow):
         return QIcon(pix)
 
     def add_files(self):
-        dlg = FileFolderDialog(self, "Select files", str(self.last_dir_add))
+        dlg = FileFolderDialog(self, self._t("Select files"), str(self.last_dir_add))
         dlg.setFileMode(QFileDialog.ExistingFiles)
         dlg.setOptions(dlg.options() | QFileDialog.DontUseNativeDialog | QFileDialog.ReadOnly)
         dlg.setOption(QFileDialog.ShowDirsOnly, False)
@@ -913,7 +1095,7 @@ class MainWindow(QMainWindow):
         shortcut.activated.connect(_select_all)
         dlg._select_all_shortcut = shortcut  # keep alive
         
-        force_dialog_accept_label(dlg, "Add")
+        force_dialog_accept_label(dlg, self._t("Add"))
 
         if dlg.exec():
             paths = dlg.selected_paths()
@@ -1012,7 +1194,7 @@ class MainWindow(QMainWindow):
         try:
             writers = list_imapi_writers()
         except Exception as e:
-            self._append_log(f"Writer lookup failed: {e}")
+            self._append_log("Writer lookup failed: {err}", err=e)
             return None
 
         new_uids = {w["uid"] for w in writers}
@@ -1038,7 +1220,7 @@ class MainWindow(QMainWindow):
 
     def _on_writers_result(self, writers, err):
         if err:
-            self._append_log(f"Writer lookup failed: {err}")
+            self._append_log("Writer lookup failed: {err}", err=err)
             return
         writers = writers or []
         new_uids = {w["uid"] for w in writers}
@@ -1081,7 +1263,7 @@ class MainWindow(QMainWindow):
                 return
             out_path = self.iso_out_path_edit.text().strip()
             if not out_path:
-                QMessageBox.warning(self, "ISO", "Please choose an ISO output path first.")
+                QMessageBox.warning(self, self._t("ISO"), self._t("Please choose an ISO output path first."))
                 return
             if not Path(out_path).exists():
                 self._iso_out_seen.add(out_path)  # mark so next burn prompts
@@ -1089,8 +1271,8 @@ class MainWindow(QMainWindow):
                 if out_path in self._iso_out_seen:
                     if QMessageBox.question(
                         self,
-                        "Overwrite",
-                        f"File already exists:\n{out_path}\nOverwrite it?",
+                        self._t("Overwrite"),
+                        self._t("File already exists:\\n{path}\\nOverwrite it?", path=out_path),
                         QMessageBox.Yes | QMessageBox.No,
                         QMessageBox.No,
                     ) != QMessageBox.Yes:
@@ -1114,7 +1296,7 @@ class MainWindow(QMainWindow):
         self.log.clear()
         self.progress.setValue(0)
         self._reset_progress_info_label()
-        self.status.setText("Preparing...")
+        self._set_status_text("Preparing...")
         self._set_ui_enabled(False)
         self._burn_started_at = time.perf_counter()
         self._burning = True
@@ -1160,7 +1342,7 @@ class MainWindow(QMainWindow):
     def stop_burn(self):
         if self.worker and self.worker.isRunning():
             self.worker.request_stop()
-            self.status.setText("Stopping...")
+            self._set_status_text("Stopping...")
             self.btn_stop.setEnabled(False)
 
     def _on_done(self, ok: bool, msg: str):
@@ -1170,19 +1352,19 @@ class MainWindow(QMainWindow):
         self.worker = None
         if self._burn_started_at is not None:
             elapsed = time.perf_counter() - self._burn_started_at
-            self._append_log(f"Burn time: {self._format_duration(elapsed)}")
+            self._append_log("Burn time: {duration}", duration=self._format_duration(elapsed))
             self._burn_started_at = None
         self._stop_elapsed_timer()
         if self._media_usage_dirty:
             self._update_media_usage_label()
         if ok:
-            self.status.setText("Completed")
+            self._set_status_text("Completed")
             self.progress.setValue(100)
             QApplication.beep()
             box = QMessageBox(self)
             box.setIcon(QMessageBox.Question)
-            box.setWindowTitle("Done")
-            box.setText("Eject disc?")
+            box.setWindowTitle(self._t("Done"))
+            box.setText(self._t("Eject disc?"))
             box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
             box.setDefaultButton(QMessageBox.Yes)
             box.setMinimumWidth(260)  # target a narrower width
@@ -1192,12 +1374,12 @@ class MainWindow(QMainWindow):
             if box.exec() == QMessageBox.Yes:
                 self.eject_disc()
         else:
-            self.status.setText("Failed" if msg != "Stopped by user" else "Stopped")
+            self._set_status_text("Failed" if msg != "Stopped by user" else "Stopped")
             if msg != "Stopped by user":
-                QMessageBox.critical(self, "Failed", msg)
+                QMessageBox.critical(self, self._t("Failed"), msg)
         # Reset to idle state after showing completion/failure
         self.progress.setValue(0)
-        self.status.setText("Idle")
+        self._set_status_text("Idle")
         self._reset_progress_info_label()
         self._update_burn_enabled()
 
@@ -1216,13 +1398,18 @@ class MainWindow(QMainWindow):
                 rec.InitializeDiscRecorder(uid)
                 rec.EjectMedia()
             except Exception as e:
-                self._append_log(f"Eject failed: {e}")
+                self._append_log("Eject failed: {error}", error=e)
             finally:
                 if coinit and pythoncom:
                     try:
                         pythoncom.CoUninitialize()
                     except Exception:
                         pass
+
+    def _set_status_text(self, text_key: str, **fmt):
+        self._status_text_key = text_key
+        if hasattr(self, "status"):
+            self.status.setText(self._t(text_key, **fmt))
 
     def _set_ui_enabled(self, enabled: bool):
         create_iso = self._is_create_iso_mode()
@@ -1255,12 +1442,18 @@ class MainWindow(QMainWindow):
             self.btn_stop.setEnabled(True)
         self._update_burn_enabled()
 
-    def _set_media_status(self, text: str):
+    def _set_media_status(self, key: str, *, status_key: str | None = None, **kwargs):
         # 굽기/ISO 작업 중에는 상태 표시/로그를 건드리지 않아 혼선을 막는다.
         if self._burning:
             return
+        payload = dict(kwargs)
+        if status_key is not None:
+            payload["status"] = self._t(status_key)
+        text = self._t(key, **payload)
+        self._last_media_key = key
+        self._last_media_kwargs = {"status_key": status_key, **kwargs}
         if text != self._last_media_text:
-            self._append_log(f"Media status -> {text}")
+            self._append_log("Media status -> {text}", text=text)
             self._last_media_text = text
         self.media_status.setText(text)
 
@@ -1295,8 +1488,8 @@ class MainWindow(QMainWindow):
         if uid != self.drive.currentData():
             return
         self._media_capacity_bytes = capacity if isinstance(capacity, int) else None
-        status = "Blank disc" if blank else ("Has data" if supported else "No disc/Unsupported")
-        self._set_media_status(f"Media status: {status}")
+        status_key = "Blank disc" if blank else ("Has data" if supported else "No disc/Unsupported")
+        self._set_media_status("Media status: {status}", status_key=status_key)
         self._media_blank = bool(blank and supported)
         state = (uid, bool(blank), bool(supported), self._media_capacity_bytes)
         if state != self._last_media_state:
@@ -1333,12 +1526,12 @@ class MainWindow(QMainWindow):
             return
         use_iso = self._use_iso_input() and not self._is_create_iso_mode()
         if self._pending_size and not use_iso:
-            self.media_usage_label.setText("Media usage: calculating...")
+            self.media_usage_label.setText(self._t("Media usage: calculating..."))
             self.media_usage_label.setStyleSheet("")
             return
         if use_iso:
             if self._iso_path and self._iso_size is None:
-                self.media_usage_label.setText("Media usage: calculating...")
+                self.media_usage_label.setText(self._t("Media usage: calculating..."))
                 self.media_usage_label.setStyleSheet("")
                 return
             current_size = self._iso_size or 0
@@ -1354,13 +1547,21 @@ class MainWindow(QMainWindow):
             pct = (est_size / usable) * 100 if usable else 0.0
             over = self._is_over_capacity(est_size)
             self.media_usage_label.setText(
-                f"Media: {self._format_size(est_size)} of {self._format_size(usable)} usable "
-                f"({pct:.1f}%, total {self._format_size(cap)})"
+                self._t(
+                    "Media: {used} of {usable} usable ({pct}%, total {total})",
+                    used=self._format_size(est_size),
+                    usable=self._format_size(usable),
+                    pct=f"{pct:.1f}",
+                    total=self._format_size(cap),
+                )
             )
             _, warn_color = self._status_colors()
             self.media_usage_label.setStyleSheet(f"color: {warn_color};" if over else "")
         else:
-            self.media_usage_label.setText(f"Media usage: {self._format_size(current_size)} / {'unknown' if not cap else self._format_size(cap)}")
+            total = self._t("unknown") if not cap else self._format_size(cap)
+            self.media_usage_label.setText(
+                self._t("Media usage: {used} / {total}", used=self._format_size(current_size), total=total)
+            )
             self.media_usage_label.setStyleSheet("")
         self._media_usage_dirty = False
 
@@ -1395,7 +1596,7 @@ class MainWindow(QMainWindow):
 
     def _reset_progress_info_label(self):
         if hasattr(self, "progress_info"):
-            self.progress_info.setText("Elapsed: --")
+            self.progress_info.setText(self._t("Elapsed: --"))
         self._stop_elapsed_timer()
         if hasattr(self, "elapsed_timer"):
             self.elapsed_timer.stop()
@@ -1409,14 +1610,14 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "progress_info"):
             return
         if self._burn_started_at is None:
-            self.progress_info.setText("Elapsed: --")
+            self.progress_info.setText(self._t("Elapsed: --"))
             self._stop_elapsed_timer()
             return
         elapsed = max(0.0, time.perf_counter() - self._burn_started_at)
-        self.progress_info.setText(f"Elapsed: {self._format_duration(elapsed)}")
+        self.progress_info.setText(self._t("Elapsed: {duration}", duration=self._format_duration(elapsed)))
 
     def _on_status_change(self, text: str):
-        self.status.setText(text)
+        self._set_status_text(text)
         self._ensure_elapsed_timer_running()
 
     def _ensure_elapsed_timer_running(self):
@@ -1429,18 +1630,18 @@ class MainWindow(QMainWindow):
 
     def _update_total_size_label(self):
         if self._use_iso_input() and not self._is_create_iso_mode():
-            text = "Total size: --"
+            text = self._t("Total size: --")
             if self._iso_path:
                 if self._iso_size is None:
-                    text = "Total size: calculating..."
+                    text = self._t("Total size: calculating...")
                 else:
-                    text = f"Total size: {self._format_size(self._iso_size)}"
+                    text = self._t("Total size: {size}", size=self._format_size(self._iso_size))
             self.total_size_label.setText(text)
         else:
             if self._pending_size:
-                self.total_size_label.setText("Total size: calculating...")
+                self.total_size_label.setText(self._t("Total size: calculating..."))
             else:
-                self.total_size_label.setText(f"Total size: {self._format_size(self._total_size)}")
+                self.total_size_label.setText(self._t("Total size: {size}", size=self._format_size(self._total_size)))
         self._update_media_usage_label()
 
     def _update_list_buttons_and_burn_state(self):
@@ -1456,9 +1657,10 @@ class MainWindow(QMainWindow):
             self.btn_burn.setEnabled(False)
             if hasattr(self, "_icon_burn_ready"):
                 self.btn_burn.setIcon(self._icon_burn_default)
-            status_text = "Processing..." if self._active_job == "iso" else "Burning..."
+            status_key = "Processing..." if self._active_job == "iso" else "Burning..."
+            status_text = self._t(status_key)
             if status_text != self._last_status_text:
-                self._append_log(f"Status -> {status_text}")
+                self._append_log("Status -> {text}", text=status_text)
                 self._last_status_text = status_text
             self.status_label.setText(status_text)
             self.status_label.setStyleSheet("color: #0078d7")
@@ -1504,9 +1706,10 @@ class MainWindow(QMainWindow):
         self.btn_burn.setEnabled(ready)
         if hasattr(self, "_icon_burn_ready"):
             self.btn_burn.setIcon(self._icon_burn_ready if ready else self._icon_burn_default)
-        status_text = "Ready" if ready else f"Not Ready: {', '.join(reasons)}"
+        translated_reasons = [self._t(r) for r in reasons]
+        status_text = self._t("Ready") if ready else self._t("Not Ready: {reasons}", reasons=", ".join(translated_reasons))
         if status_text != self._last_status_text:
-            self._append_log(f"Status -> {status_text}")
+            self._append_log("Status -> {text}", text=status_text)
             self._last_status_text = status_text
         self.status_label.setText(status_text)
         ready_color, warn_color = self._status_colors()
@@ -1550,7 +1753,7 @@ class MainWindow(QMainWindow):
         out_path = self.iso_out_path_edit.text().strip()
         if not out_path:
             self._append_log("Select ISO output path first.")
-            QMessageBox.warning(self, "ISO", "Please choose an ISO output path first.")
+            QMessageBox.warning(self, self._t("ISO"), self._t("Please choose an ISO output path first."))
             return
         if not Path(out_path).exists():
             self._iso_out_seen.add(out_path)
@@ -1565,7 +1768,7 @@ class MainWindow(QMainWindow):
         self.log.clear()
         self.progress.setValue(0)
         self._reset_progress_info_label()
-        self.status.setText("Preparing ISO...")
+        self._set_status_text("Preparing ISO...")
         self._set_ui_enabled(False)
         self._burn_started_at = time.perf_counter()
         self._burning = True
@@ -1584,7 +1787,7 @@ class MainWindow(QMainWindow):
         )
         self.worker.log.connect(self._append_log)
         self.worker.progress.connect(self.progress.setValue)
-        self.worker.status.connect(self.status.setText)
+        self.worker.status.connect(self._on_status_change)
         self.worker.progress_info.connect(self._on_progress_info)
         self.worker.done.connect(self._on_iso_done)
         self.worker.start()
@@ -1596,27 +1799,27 @@ class MainWindow(QMainWindow):
         self.worker = None
         if self._burn_started_at is not None:
             elapsed = time.perf_counter() - self._burn_started_at
-            self._append_log(f"ISO job time: {self._format_duration(elapsed)}")
+            self._append_log("ISO job time: {duration}", duration=self._format_duration(elapsed))
             self._burn_started_at = None
         self._stop_elapsed_timer()
         if self._media_usage_dirty:
             self._update_media_usage_label()
         if ok:
-            self.status.setText("ISO created")
+            self._set_status_text("ISO created")
             self.progress.setValue(100)
             box = QMessageBox(self)
-            box.setWindowTitle("ISO")
-            box.setText("ISO creation completed.")
-            open_btn = box.addButton("Open folder", QMessageBox.AcceptRole)
+            box.setWindowTitle(self._t("ISO"))
+            box.setText(self._t("ISO creation completed."))
+            open_btn = box.addButton(self._t("Open folder"), QMessageBox.AcceptRole)
             box.addButton(QMessageBox.Ok)
             box.exec()
             if box.clickedButton() == open_btn:
                 self._open_iso_output_folder()
         else:
-            self.status.setText("Failed")
-            QMessageBox.critical(self, "ISO", "ISO creation failed.")
+            self._set_status_text("Failed")
+            QMessageBox.critical(self, self._t("ISO"), self._t("ISO creation failed."))
         self.progress.setValue(0)
-        self.status.setText("Idle")
+        self._set_status_text("Idle")
         self._reset_progress_info_label()
         self._update_burn_enabled()
 
@@ -1640,8 +1843,8 @@ class MainWindow(QMainWindow):
             if not self._pending_close:
                 ret = QMessageBox.question(
                     self,
-                    "Exit",
-                    "A burn is in progress. Stop and exit after it halts?",
+                    self._t("Exit"),
+                    self._t("A burn is in progress. Stop and exit after it halts?"),
                     QMessageBox.Yes | QMessageBox.No,
                     QMessageBox.No,
                 )
@@ -1659,7 +1862,7 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
                 try:
-                    self.status.setText("Stopping...")
+                    self._set_status_text("Stopping...")
                 except Exception:
                     pass
             event.ignore()
