@@ -10,7 +10,8 @@ from PySide6.QtWidgets import (
     QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QHBoxLayout,
     QPushButton, QProgressBar, QTextEdit, QVBoxLayout, QWidget, QComboBox,
     QDialog, QAbstractItemView, QListView, QTreeView, QFileSystemModel,
-    QSizePolicy, QRadioButton, QCheckBox, QSplitter, QStyle, QProxyStyle
+    QSizePolicy, QRadioButton, QCheckBox, QSplitter, QStyle, QProxyStyle,
+    QSpacerItem
 )
 
 from constants import APP_ICON_PATH, APP_TITLE, FS_ISO9660, FS_JOLIET, FS_UDF
@@ -1178,7 +1179,17 @@ class MainWindow(QMainWindow):
             self.status.setText("Completed")
             self.progress.setValue(100)
             QApplication.beep()
-            if QMessageBox.question(self, "Done", "Eject disc?", QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Question)
+            box.setWindowTitle("Done")
+            box.setText("Eject disc?")
+            box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+            box.setDefaultButton(QMessageBox.Yes)
+            box.setMinimumWidth(260)  # target a narrower width
+            spacer = QSpacerItem(240, 0, QSizePolicy.MinimumExpanding, QSizePolicy.Minimum)
+            layout = box.layout()
+            layout.addItem(spacer, layout.rowCount(), 0, 1, layout.columnCount())
+            if box.exec() == QMessageBox.Yes:
                 self.eject_disc()
         else:
             self.status.setText("Failed" if msg != "Stopped by user" else "Stopped")
