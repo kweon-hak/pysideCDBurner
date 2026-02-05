@@ -540,11 +540,10 @@ class MainWindow(QMainWindow):
         gl.addStretch(1)
 
         act_row = QHBoxLayout()
-        # Add a leading space so icon and text have visible separation.
         self.btn_burn = QPushButton()
-        self._bind_text(self.btn_burn, "setText", " Burn")
+        self._bind_text(self.btn_burn, "setText", "Burn")
         self.btn_stop = QPushButton()
-        self._bind_text(self.btn_stop, "setText", " Stop")
+        self._bind_text(self.btn_stop, "setText", "Stop")
         for btn in (self.btn_burn, self.btn_stop):
             btn.setMinimumHeight(36)
             # Extra padding further separates icon and label.
@@ -1015,8 +1014,8 @@ class MainWindow(QMainWindow):
         text_col.setContentsMargins(12, 0, 0, 0)
         label = QLabel(
             f"<p align='left'>{self._t(APP_TITLE)}</p>"
-            f"<p align='left'>{self._t('Updated: 2025.12')}</p>"
-            f"<p align='left'>{self._t('Author: KHLEE')}</p>"
+            "<p align='left'>Updated: 2025.12</p>"
+            "<p align='left'>Author: KHLEE</p>"
             f"<p align='left'>{self._t('Simple, fast ISO creation and disc burning tool.')}</p>"
         )
         text_col.addWidget(label)
