@@ -18,7 +18,7 @@ try:
 except Exception:
     shiboken6 = None
 
-from constants import APP_ICON_PATH, APP_TITLE, FS_ISO9660, FS_JOLIET, FS_UDF
+from constants import APP_ICON_PATH, APP_TITLE, AUTHOR, DESCRIPTION, FS_ISO9660, FS_JOLIET, FS_UDF, UPDATED
 from translations import LANGUAGE_NAMES, TRANSLATIONS
 from utils import sanitize_volume_label, force_dialog_accept_label
 from widgets import FileFolderDialog, CustomIconProvider
@@ -210,12 +210,9 @@ class MainWindow(QMainWindow):
             ("ISO9660 + Joliet + UDF", FS_ISO9660 | FS_JOLIET | FS_UDF),
         ]
         _default_fs = FS_ISO9660 | FS_JOLIET
-        last_dir_add_val = self.settings.value("last_dir_add", str(Path.home()))
-        self.last_dir_add = Path(last_dir_add_val) if Path(last_dir_add_val).exists() else Path.home()
-        last_dir_iso_in_val = self.settings.value("last_dir_iso_in", str(self.last_dir_add))
-        self.last_dir_iso_in = Path(last_dir_iso_in_val) if Path(last_dir_iso_in_val).exists() else self.last_dir_add
-        last_dir_iso_out_val = self.settings.value("last_dir_iso_out", str(self.last_dir_add))
-        self.last_dir_iso_out = Path(last_dir_iso_out_val) if Path(last_dir_iso_out_val).exists() else self.last_dir_add
+        self.last_dir_add = self._load_dir_setting("last_dir_add", Path.home())
+        self.last_dir_iso_in = self._load_dir_setting("last_dir_iso_in", self.last_dir_add)
+        self.last_dir_iso_out = self._load_dir_setting("last_dir_iso_out", self.last_dir_add)
         self._media_blank = False
         self._burn_started_at: float | None = None
         self._burning: bool = False
@@ -942,7 +939,7 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(
             self,
             self._t("Select ISO file"),
-            str(self.last_dir_iso_in),
+            str(self._existing_dir(self.last_dir_iso_in, self.last_dir_add)),
             self._t("ISO files (*.iso);;All files (*)"),
         )
         if path:
@@ -965,7 +962,7 @@ class MainWindow(QMainWindow):
         self._update_burn_enabled()
 
     def _select_iso_output(self):
-        dlg = QFileDialog(self, self._t("Save ISO file"), str(self.last_dir_iso_out))
+        dlg = QFileDialog(self, self._t("Save ISO file"), str(self._existing_dir(self.last_dir_iso_out, self.last_dir_add)))
         dlg.setAcceptMode(QFileDialog.AcceptSave)
         dlg.setNameFilter(self._t("ISO files (*.iso)"))
         dlg.setDefaultSuffix("iso")
@@ -1014,9 +1011,9 @@ class MainWindow(QMainWindow):
         text_col.setContentsMargins(12, 0, 0, 0)
         label = QLabel(
             f"<p align='left'>{self._t(APP_TITLE)}</p>"
-            "<p align='left'>Updated: 2025.12</p>"
-            "<p align='left'>Author: KHLEE</p>"
-            f"<p align='left'>{self._t('Simple, fast ISO creation and disc burning tool.')}</p>"
+            f"<p align='left'>{self._t('Updated:')} {UPDATED}</p>"
+            f"<p align='left'>{self._t('Author:')} {AUTHOR}</p>"
+            f"<p align='left'>{self._t(DESCRIPTION)}</p>"
         )
         text_col.addWidget(label)
         text_col.addStretch(1)
@@ -1060,7 +1057,7 @@ class MainWindow(QMainWindow):
         return QIcon(pix)
 
     def add_files(self):
-        dlg = FileFolderDialog(self, self._t("Select files"), str(self.last_dir_add))
+        dlg = FileFolderDialog(self, self._t("Select files"), str(self._existing_dir(self.last_dir_add)))
         dlg.setFileMode(QFileDialog.ExistingFiles)
         dlg.setOptions(dlg.options() | QFileDialog.DontUseNativeDialog | QFileDialog.ReadOnly)
         dlg.setOption(QFileDialog.ShowDirsOnly, False)
@@ -1103,12 +1100,11 @@ class MainWindow(QMainWindow):
             for p in paths:
                 self._add_path(p)
         self._update_list_buttons_and_burn_state()
-        try:
-            current_dir = Path(dlg.directory().absolutePath())
-            if current_dir.exists():
-                self.last_dir_add = current_dir
-        except Exception:
-            pass
+        if not self.list.count():
+            try:
+                self._set_last_dir_add(Path(dlg.directory().absolutePath()))
+            except Exception:
+                pass
 
     def _on_drop_add(self, path: str):
         self._add_path(path)
@@ -1116,6 +1112,7 @@ class MainWindow(QMainWindow):
 
     def _add_path(self, p: str):
         p = os.path.abspath(p)
+        self._set_last_dir_from_selection(p)
         for i in range(self.list.count()):
             if self.list.item(i).text() == p:
                 return
@@ -1720,22 +1717,60 @@ class MainWindow(QMainWindow):
         # Only enable remove when UI is not locked for burning
         self.btn_remove.setEnabled(self.btn_add_files.isEnabled() and len(self.list.selectedItems()) > 0)
 
+    def _existing_dir(self, value: str | Path | None, fallback: Path | None = None) -> Path:
+        fallback_dir = Path.home()
+        if fallback is not None:
+            try:
+                fallback_candidate = Path(fallback).expanduser()
+                if fallback_candidate.exists() and fallback_candidate.is_dir():
+                    fallback_dir = fallback_candidate
+            except Exception:
+                pass
+
+        try:
+            candidate = Path(value).expanduser() if value else fallback_dir
+        except Exception:
+            return fallback_dir
+
+        if candidate.exists() and candidate.is_file():
+            candidate = candidate.parent
+
+        for current in (candidate, *candidate.parents):
+            try:
+                if current.exists() and current.is_dir():
+                    return current
+            except Exception:
+                continue
+        return fallback_dir
+
+    def _load_dir_setting(self, key: str, fallback: Path | None = None) -> Path:
+        resolved_fallback = self._existing_dir(fallback, Path.home())
+        raw_value = self.settings.value(key, str(resolved_fallback))
+        resolved_value = self._existing_dir(raw_value, resolved_fallback)
+        if str(raw_value) != str(resolved_value):
+            self.settings.setValue(key, str(resolved_value))
+            self.settings.sync()
+        return resolved_value
+
     def _set_last_dir_add(self, path: Path):
-        if path.exists():
-            self.last_dir_add = path
-            self.settings.setValue("last_dir_add", str(path))
+        resolved = self._existing_dir(path, self.last_dir_add)
+        if resolved.exists():
+            self.last_dir_add = resolved
+            self.settings.setValue("last_dir_add", str(resolved))
             self.settings.sync()
 
     def _set_last_dir_iso_in(self, path: Path):
-        if path.exists():
-            self.last_dir_iso_in = path
-            self.settings.setValue("last_dir_iso_in", str(path))
+        resolved = self._existing_dir(path, self.last_dir_add)
+        if resolved.exists():
+            self.last_dir_iso_in = resolved
+            self.settings.setValue("last_dir_iso_in", str(resolved))
             self.settings.sync()
 
     def _set_last_dir_iso_out(self, path: Path):
-        if path.exists():
-            self.last_dir_iso_out = path
-            self.settings.setValue("last_dir_iso_out", str(path))
+        resolved = self._existing_dir(path, self.last_dir_add)
+        if resolved.exists():
+            self.last_dir_iso_out = resolved
+            self.settings.setValue("last_dir_iso_out", str(resolved))
             self.settings.sync()
 
     def _set_last_dir_from_selection(self, sel: str):
